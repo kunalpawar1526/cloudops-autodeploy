@@ -1,4 +1,4 @@
-name: CloudOps CI
+name: CloudOps CI/CD
 
 on:
   push:
@@ -13,9 +13,14 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: cloudops-autodeploy
+  EC2_INSTANCE_ID: i-083e21bfda7c32616
+
 jobs:
-  test:
-    name: Test Application
+  build-and-deploy:
+    name: Build, Push & Deploy
     runs-on: ubuntu-latest
 
     steps:
@@ -44,8 +49,76 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ap-south-1
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build production Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+
+      - name: Push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Deploy to EC2 using SSM
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          DEPLOY_SCRIPT=$(cat <<EOF
+          set -e
+
+          echo "Logging in to Amazon ECR..."
+          aws ecr get-login-password --region $AWS_REGION | \
+            docker login --username AWS --password-stdin $ECR_REGISTRY
+
+          echo "Pulling new Docker image..."
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          echo "Stopping old container..."
+          docker stop cloudops-app || true
+
+          echo "Removing old container..."
+          docker rm cloudops-app || true
+
+          echo "Starting new container..."
+          docker run -d \
+            --name cloudops-app \
+            --restart unless-stopped \
+            -p 8080:5000 \
+            $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          echo "Checking application health..."
+          sleep 5
+          curl -f http://localhost:8080/health
+
+          echo "Deployment successful!"
+          EOF
+          )
+
+          COMMANDS=$(jq -nc --arg script "$DEPLOY_SCRIPT" \
+            '{commands: [$script]}')
+
+          aws ssm send-command \
+            --region $AWS_REGION \
+            --instance-ids $EC2_INSTANCE_ID \
+            --document-name "AWS-RunShellScript" \
+            --comment "CloudOps AutoDeploy - ${GITHUB_SHA}" \
+            --parameters "$COMMANDS"
